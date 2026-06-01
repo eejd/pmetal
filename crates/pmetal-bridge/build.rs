@@ -267,6 +267,14 @@ fn run_cmake_build() -> PathBuf {
     config.define("CMAKE_C_COMPILER", "/usr/bin/cc");
     config.define("CMAKE_CXX_COMPILER", "/usr/bin/c++");
 
+    // Allow offline/sandbox builds (e.g., MacPorts): if
+    // FETCHCONTENT_SOURCE_DIR_MLX is set, cmake uses the pre-fetched local
+    // source tree instead of cloning from GitHub.
+    if let Ok(mlx_src) = env::var("FETCHCONTENT_SOURCE_DIR_MLX") {
+        config.define("FETCHCONTENT_SOURCE_DIR_MLX", &mlx_src);
+        config.define("FETCHCONTENT_FULLY_DISCONNECTED", "ON");
+    }
+
     #[cfg(target_os = "macos")]
     {
         let target = resolve_deployment_target();

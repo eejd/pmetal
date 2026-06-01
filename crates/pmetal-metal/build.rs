@@ -189,6 +189,25 @@ fn check_metal_toolchain() {
     }
 }
 
+/// Return the HOME directory to use when invoking xcrun.
+///
+/// On macOS 26 (Tahoe), Apple moved the Metal compiler into a cryptex that
+/// xcrun discovers via a per-user mapping plist at
+/// ~/Library/Developer/Xcode/XcodeToMetalToolchainIndexMapping.plist.
+/// If the real HOME has that plist, use it so xcrun can find the compiler.
+/// Otherwise fall back to out_dir (isolates xcrun's cache writes from the
+/// user's real home directory, which is the right behaviour on macOS < 26).
+fn xcrun_home(out_dir: &Path) -> String {
+    let real = std::env::var("HOME").unwrap_or_default();
+    let mapping = std::path::Path::new(&real)
+        .join("Library/Developer/Xcode/XcodeToMetalToolchainIndexMapping.plist");
+    if mapping.exists() {
+        real
+    } else {
+        out_dir.to_string_lossy().into_owned()
+    }
+}
+
 fn compile_metal_shaders(shaders_dir: &Path, out_dir: &Path, target: &str, lib_name: &str) {
     let cache_root = out_dir.join(".cache");
     std::fs::create_dir_all(&cache_root).expect("Failed to create shader compiler cache");
@@ -227,7 +246,7 @@ fn compile_metal_shaders(shaders_dir: &Path, out_dir: &Path, target: &str, lib_n
         println!("cargo:rerun-if-changed={}", metal_file.display());
 
         let output = Command::new("xcrun")
-            .env("HOME", out_dir)
+            .env("HOME", xcrun_home(out_dir))
             .env("XDG_CACHE_HOME", &cache_root)
             .args([
                 "-sdk",
@@ -277,7 +296,7 @@ fn compile_metal_shaders(shaders_dir: &Path, out_dir: &Path, target: &str, lib_n
     let metallib_file = out_dir.join(format!("{}.metallib", lib_name));
 
     let mut cmd = Command::new("xcrun");
-    cmd.env("HOME", out_dir);
+    cmd.env("HOME", xcrun_home(out_dir));
     cmd.env("XDG_CACHE_HOME", &cache_root);
     cmd.args(["-sdk", "macosx", "metallib"]);
 
