@@ -267,6 +267,15 @@ fn run_cmake_build() -> PathBuf {
     config.define("CMAKE_C_COMPILER", "/usr/bin/cc");
     config.define("CMAKE_CXX_COMPILER", "/usr/bin/c++");
 
+    // Allow offline/sandbox builds (e.g., MacPorts): forward any
+    // FETCHCONTENT_SOURCE_DIR_* and FETCHCONTENT_FULLY_DISCONNECTED env vars
+    // to cmake so pre-fetched source trees are used instead of git clones.
+    for (key, val) in env::vars() {
+        if key.starts_with("FETCHCONTENT_SOURCE_DIR_") || key == "FETCHCONTENT_FULLY_DISCONNECTED" {
+            config.define(&key, &val);
+        }
+    }
+
     #[cfg(target_os = "macos")]
     {
         let target = resolve_deployment_target();
