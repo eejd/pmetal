@@ -383,7 +383,19 @@ fn build_and_link() {
                     #[cfg(target_os = "macos")]
                     set_dylib_install_name(&prefix.join("lib").join(mlx_dylib_name()));
                 }
-                (dst.join("build/lib"), dst.join("build/_deps/mlx-src"))
+                // When FETCHCONTENT_SOURCE_DIR_MLX is set (e.g., MacPorts sandbox),
+                // CMake uses that path directly and never creates _deps/mlx-src.
+                // Fall back to the env var so the bridge C++ is compiled against
+                // the same headers that libmlx.dylib was built from.
+                let mlx_src = dst.join("build/_deps/mlx-src");
+                let mlx_inc = if mlx_src.exists() {
+                    mlx_src
+                } else if let Ok(dir) = env::var("FETCHCONTENT_SOURCE_DIR_MLX") {
+                    PathBuf::from(dir)
+                } else {
+                    dst.join("build/_deps/mlx-src")
+                };
+                (dst.join("build/lib"), mlx_inc)
             }
         };
 
