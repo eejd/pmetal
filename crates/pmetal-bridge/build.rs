@@ -267,6 +267,15 @@ fn run_cmake_build() -> PathBuf {
     config.define("CMAKE_C_COMPILER", "/usr/bin/cc");
     config.define("CMAKE_CXX_COMPILER", "/usr/bin/c++");
 
+    // Allow offline/sandbox builds (e.g., MacPorts): forward any
+    // FETCHCONTENT_SOURCE_DIR_* and FETCHCONTENT_FULLY_DISCONNECTED env vars
+    // to cmake so pre-fetched source trees are used instead of git clones.
+    for (key, val) in env::vars() {
+        if key.starts_with("FETCHCONTENT_SOURCE_DIR_") || key == "FETCHCONTENT_FULLY_DISCONNECTED" {
+            config.define(&key, &val);
+        }
+    }
+
     #[cfg(target_os = "macos")]
     {
         let target = resolve_deployment_target();
@@ -383,7 +392,19 @@ fn build_and_link() {
                     #[cfg(target_os = "macos")]
                     set_dylib_install_name(&prefix.join("lib").join(mlx_dylib_name()));
                 }
-                (dst.join("build/lib"), dst.join("build/_deps/mlx-src"))
+                // When FETCHCONTENT_SOURCE_DIR_MLX is set (e.g., MacPorts sandbox),
+                // CMake uses that path directly and never creates _deps/mlx-src.
+                // Fall back to the env var so the bridge C++ is compiled against
+                // the same headers that libmlx.dylib was built from.
+                let mlx_src = dst.join("build/_deps/mlx-src");
+                let mlx_inc = if mlx_src.exists() {
+                    mlx_src
+                } else if let Ok(dir) = env::var("FETCHCONTENT_SOURCE_DIR_MLX") {
+                    PathBuf::from(dir)
+                } else {
+                    dst.join("build/_deps/mlx-src")
+                };
+                (dst.join("build/lib"), mlx_inc)
             }
         };
 
