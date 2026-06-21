@@ -1,0 +1,55 @@
+# promptfoo.yaml — Behavioral parity evaluation: pmetal vs. vllm-mlx
+#
+# Runs the same prompts through both servers (greedy / seeded for
+# determinism) and surfaces divergences in the promptfoo report.
+#
+# Usage:
+#   # Install promptfoo (once):
+#   npm install -g promptfoo
+#
+#   # Start pmetal on port 8000 and vllm-mlx on port 8001, then:
+#   promptfoo eval --config eval/promptfoo.yaml
+#   promptfoo view
+
+description: "pmetal vs. vllm-mlx text output parity"
+
+providers:
+  - id: openai:chat:default
+    label: pmetal
+    config:
+      apiBaseUrl: http://localhost:8000/v1
+      apiKey: not-needed
+      temperature: 0.0
+      seed: 42
+      max_tokens: 128
+
+  - id: openai:chat:default
+    label: vllm-mlx
+    config:
+      apiBaseUrl: http://localhost:8001/v1
+      apiKey: not-needed
+      temperature: 0.0
+      seed: 42
+      max_tokens: 128
+
+prompts:
+  - "Explain attention in transformer models in one sentence."
+  - "What is the difference between supervised and unsupervised learning?"
+  - "Write a haiku about Metal GPU shaders."
+  - "List 3 key properties of Rust's ownership system."
+  - "In one sentence: why is KV cache important for autoregressive decoding?"
+  - "What does TTFT stand for and why does it matter for LLM serving?"
+  - "Describe prefix caching in LLM inference in 2 sentences."
+  - "What is continuous batching? Answer in one sentence."
+  - "Why might Rust outperform Python for a high-concurrency HTTP server?"
+  - "What is LoRA and what problem does it solve? Be brief."
+
+tests:
+  # Each test checks both servers and compares their outputs.
+  # promptfoo's built-in semantic-similarity assertion grades divergence.
+  - description: "Semantic parity across all prompts"
+    assert:
+      # Expect outputs to be semantically similar (≥ 0.7 cosine similarity)
+      - type: similar
+        value: "{{pmetal}}"
+        threshold: 0.70

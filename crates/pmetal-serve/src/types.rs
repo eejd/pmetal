@@ -51,7 +51,11 @@ where
     deserializer.deserialize_any(StringOrVec)
 }
 
-/// Chat message.
+/// Chat message used in **responses** (serialized) and in the engine's
+/// internal message representation. Content is always a plain string here.
+///
+/// For *request* deserialization — where OpenAI allows content to be either
+/// a string or an array of typed parts — see [`ChatRequestMessage`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
@@ -65,13 +69,133 @@ pub struct ChatMessage {
     pub tool_calls: Option<Vec<ToolCall>>,
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// OpenAI chat message content — string or array-of-parts
+//
+// OpenAI's spec allows `content` to be either a plain string or an array of
+// typed content parts (`{type: "text", text: "..."}`, `{type: "image_url",
+// ...}`, etc.).  We accept both forms; non-text parts cause an explicit HTTP
+// 400 rather than silently being dropped, so the caller knows why their
+// request was rejected.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// A single content part inside an OpenAI-style parts array.
+///
+/// Known text parts are deserialized into [`OpenAIPart::Text`]; all other
+/// types (image_url, video_url, input_audio) deserialize into
+/// [`OpenAIPart::Other`] so they survive deserialization and can generate
+/// a descriptive 400 in [`OpenAIContent::as_text`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OpenAIPart {
+    /// `{"type": "text", "text": "..."}` — the only kind we can process.
+    Text { text: String },
+    /// Any other part type (image_url, video_url, input_audio, …). Captured
+    /// so the caller can produce a descriptive 400 rather than an opaque
+    /// deserialization error.
+    #[serde(other)]
+    Other,
+}
+
+/// OpenAI `content` field: either a plain string or an array of typed parts.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum OpenAIContent {
+    String(String),
+    Parts(Vec<OpenAIPart>),
+}
+
+impl OpenAIContent {
+    /// Flatten to a plain string.
+    ///
+    /// * All-text parts: joined with `\n` separators.
+    /// * Plain string: returned as-is.
+    /// * Any non-text part: returns `Err` with a descriptive message so the
+    ///   handler can surface a `400 Bad Request`.
+    pub fn as_text(&self) -> Result<String, String> {
+        match self {
+            OpenAIContent::String(s) => Ok(s.clone()),
+            OpenAIContent::Parts(parts) => {
+                let mut out = String::new();
+                for part in parts {
+                    match part {
+                        OpenAIPart::Text { text } => {
+                            if !out.is_empty() {
+                                out.push('\n');
+                            }
+                            out.push_str(text);
+                        }
+                        OpenAIPart::Other => {
+                            return Err(
+                                "vision and audio content parts are not yet supported; \
+                                 use a text-only model or omit image_url / video_url / \
+                                 input_audio content blocks"
+                                    .to_owned(),
+                            );
+                        }
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+}
+
+/// Chat message as it appears in **requests** — content may be a string *or*
+/// an array of typed parts. Use [`ChatRequestMessage::into_chat_message`] to
+/// flatten to the engine's plain-string [`ChatMessage`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatRequestMessage {
+    pub role: String,
+    pub content: OpenAIContent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+}
+
+impl ChatRequestMessage {
+    /// Flatten into the engine's [`ChatMessage`].
+    ///
+    /// Returns `Err` when any non-text content part is present. The error
+    /// string is suitable for forwarding directly to the caller as a `400`
+    /// body.
+    pub fn into_chat_message(self) -> Result<ChatMessage, String> {
+        let content = self.content.as_text()?;
+        Ok(ChatMessage {
+            role: self.role,
+            content,
+            tool_calls: self.tool_calls,
+        })
+    }
+}
+
+/// `stream_options` sub-object accepted on streaming chat completion requests.
+///
+/// Currently only `include_usage` is honoured. When set to `true`, the server
+/// emits an extra SSE chunk with `choices: []` and a populated `usage` field
+/// immediately before the `[DONE]` sentinel, following OpenAI's streaming
+/// usage-reporting spec.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct StreamOptions {
+    /// When `true`, include token usage stats in the terminal streaming chunk.
+    #[serde(default)]
+    pub include_usage: bool,
+}
+
 /// Chat completion request (POST /v1/chat/completions).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatCompletionRequest {
     pub model: String,
-    pub messages: Vec<ChatMessage>,
+    /// Messages in the conversation. Content may be a string or an array of
+    /// typed parts — use [`ChatRequestMessage::into_chat_message`] to flatten.
+    pub messages: Vec<ChatRequestMessage>,
+    /// `max_tokens` (legacy name). If both this and `max_completion_tokens`
+    /// are set, `max_completion_tokens` takes precedence (newer SDK default).
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
+    /// `max_completion_tokens` — the current OpenAI SDK default name for the
+    /// same field. Aliases `max_tokens` when present.
+    #[serde(default)]
+    pub max_completion_tokens: Option<usize>,
     #[serde(default)]
     pub temperature: Option<f32>,
     #[serde(default)]
@@ -82,6 +206,10 @@ pub struct ChatCompletionRequest {
     pub min_p: Option<f32>,
     #[serde(default)]
     pub stream: Option<bool>,
+    /// Extra streaming options. `include_usage: true` triggers a terminal
+    /// usage-bearing chunk before `[DONE]`.
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
     /// Stop sequences — accepts either a single string or an array of strings.
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub stop: Option<Vec<String>>,
@@ -111,6 +239,21 @@ pub struct ChatCompletionRequest {
     /// means chosen-token logprob only.
     #[serde(default)]
     pub top_logprobs: Option<u8>,
+    // ── Accept-and-ignore fields for broad OpenAI client compat ──────────
+    /// Accepted but ignored — per-token logit bias is not yet implemented.
+    #[serde(default)]
+    pub logit_bias: Option<serde_json::Value>,
+    /// Accepted but ignored — only `n = 1` is supported; multiple completions
+    /// are not yet implemented.
+    #[serde(default)]
+    pub n: Option<u32>,
+    /// Accepted but ignored — forwarded verbatim in error messages if needed.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Accepted but ignored — `response_format` / structured outputs are
+    /// deferred to a future milestone.
+    #[serde(default)]
+    pub response_format: Option<serde_json::Value>,
 }
 
 /// Per-token logprob entry as it appears on the wire under
@@ -363,6 +506,111 @@ mod tests {
         let text = "  \n\t{\n  \"name\": \"f\"\n}\n ";
         let calls = try_parse_tool_calls(text).expect("should parse");
         assert_eq!(calls[0].function.name, "f");
+    }
+
+    // ── OpenAI content-parts deserialization ─────────────────────────────────
+
+    #[test]
+    fn chat_request_message_plain_string_content() {
+        let msg: ChatRequestMessage = serde_json::from_str(
+            r#"{"role":"user","content":"hello"}"#,
+        )
+        .unwrap();
+        assert_eq!(msg.content.as_text().unwrap(), "hello");
+    }
+
+    #[test]
+    fn chat_request_message_text_parts_array() {
+        let msg: ChatRequestMessage = serde_json::from_str(
+            r#"{"role":"user","content":[{"type":"text","text":"foo"},{"type":"text","text":"bar"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(msg.content.as_text().unwrap(), "foo\nbar");
+    }
+
+    #[test]
+    fn chat_request_message_single_text_part() {
+        let msg: ChatRequestMessage = serde_json::from_str(
+            r#"{"role":"user","content":[{"type":"text","text":"only text"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(msg.content.as_text().unwrap(), "only text");
+    }
+
+    #[test]
+    fn chat_request_message_image_url_part_returns_err() {
+        // image_url part deserializes fine (captured as OpenAIPart::Other)
+        // but as_text() must return Err so the handler can send a 400.
+        let msg: ChatRequestMessage = serde_json::from_str(
+            r#"{"role":"user","content":[
+                {"type":"text","text":"what is this?"},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,abc"}}
+            ]}"#,
+        )
+        .unwrap();
+        assert!(
+            msg.content.as_text().is_err(),
+            "image_url part should produce an error from as_text()"
+        );
+    }
+
+    #[test]
+    fn chat_request_message_video_url_part_returns_err() {
+        let msg: ChatRequestMessage = serde_json::from_str(
+            r#"{"role":"user","content":[{"type":"video_url","video_url":{"url":"data:video/mp4;base64,xyz"}}]}"#,
+        )
+        .unwrap();
+        assert!(msg.content.as_text().is_err());
+    }
+
+    #[test]
+    fn into_chat_message_succeeds_for_plain_string() {
+        let req_msg = ChatRequestMessage {
+            role: "user".to_owned(),
+            content: OpenAIContent::String("hi".to_owned()),
+            tool_calls: None,
+        };
+        let msg = req_msg.into_chat_message().unwrap();
+        assert_eq!(msg.role, "user");
+        assert_eq!(msg.content, "hi");
+    }
+
+    #[test]
+    fn max_completion_tokens_field_deserializes() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"max_completion_tokens":100}"#,
+        )
+        .unwrap();
+        assert_eq!(req.max_completion_tokens, Some(100));
+    }
+
+    #[test]
+    fn stream_options_include_usage_deserializes() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[],"stream":true,"stream_options":{"include_usage":true}}"#,
+        )
+        .unwrap();
+        assert!(req.stream_options.unwrap().include_usage);
+    }
+
+    #[test]
+    fn tolerated_compat_fields_deserialize_without_error() {
+        // logit_bias, n, user, response_format must not cause a 400
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "model":"m",
+                "messages":[{"role":"user","content":"hi"}],
+                "logit_bias":{"100":5},
+                "n":1,
+                "user":"u123",
+                "response_format":{"type":"text"}
+            }"#,
+        )
+        .unwrap();
+        assert!(req.logit_bias.is_some());
+        assert_eq!(req.n, Some(1));
+        assert_eq!(req.user.as_deref(), Some("u123"));
+        assert!(req.response_format.is_some());
     }
 }
 

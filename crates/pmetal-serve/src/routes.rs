@@ -214,10 +214,26 @@ pub async fn chat_completions(
 ) -> Result<impl IntoResponse, ServeError> {
     let permit = state.try_acquire_request_permit()?;
 
+    // Flatten OpenAI content-parts to plain strings. Returns 400 if any
+    // non-text part (image_url, video_url, input_audio) is present — those
+    // are deferred to a future vision milestone.
+    let messages: Vec<crate::types::ChatMessage> = req
+        .messages
+        .into_iter()
+        .map(|m| {
+            m.into_chat_message()
+                .map_err(ServeError::BadRequest)
+        })
+        .collect::<Result<_, _>>()?;
+
+    // `max_completion_tokens` (newer OpenAI SDK name) takes precedence over
+    // the legacy `max_tokens` when both are present.
+    let effective_max_tokens = req.max_completion_tokens.unwrap_or(req.max_tokens);
+
     // Format messages using chat template, optionally including tool definitions.
     let prompt = state
         .engine
-        .format_chat_with_tools(&req.messages, req.tools.as_deref());
+        .format_chat_with_tools(&messages, req.tools.as_deref());
     let input_ids = state.engine.tokenize(&prompt)?;
     let prompt_tokens = input_ids.len();
     let tools_requested = req.tools.is_some();
@@ -242,7 +258,7 @@ pub async fn chat_completions(
     };
 
     let params = SamplingParams {
-        max_tokens: req.max_tokens,
+        max_tokens: effective_max_tokens,
         temperature,
         top_k: req.top_k,
         top_p: req.top_p,
@@ -256,6 +272,13 @@ pub async fn chat_completions(
         logprobs_top_n,
     };
     state.engine.validate_sampling_params(&params)?;
+
+    // Whether to emit a terminal usage-bearing SSE chunk (stream_options.include_usage).
+    let include_usage = req
+        .stream_options
+        .as_ref()
+        .map(|o| o.include_usage)
+        .unwrap_or(false);
 
     if req.stream.unwrap_or(false) {
         // ── True token-by-token streaming ────────────────────────────────────
@@ -283,6 +306,8 @@ pub async fn chat_completions(
             tools_requested,
             permit,
             resolved_stops.holdback_tokens(),
+            include_usage,
+            prompt_tokens,
         );
 
         return Ok(Sse::new(sse_stream)
@@ -556,6 +581,12 @@ fn chat_sse_stream(
     tools_requested: bool,
     _permit: OwnedSemaphorePermit,
     holdback_tokens: usize,
+    // When `true`, emit an extra usage-bearing chunk before `[DONE]`
+    // (`stream_options: {include_usage: true}` per OpenAI spec).
+    include_usage: bool,
+    // Number of prompt tokens — needed for the usage chunk, known before
+    // the stream starts.
+    prompt_tokens: usize,
 ) -> impl futures::Stream<Item = Result<Event, Infallible>> + Send + 'static {
     // Pre-build the opening event once.
     let opening = {
@@ -729,6 +760,29 @@ fn chat_sse_stream(
                 };
                 events.push(Ok(Event::default()
                     .data(serde_json::to_string(&closing).unwrap_or_default())));
+
+                // Optional usage chunk — emitted when `stream_options.include_usage`
+                // was set. Per the OpenAI spec: `choices: []`, populated `usage`.
+                // Completion tokens come from the `Done` metrics; prompt tokens
+                // were captured before streaming started.
+                if include_usage {
+                    let completion_tokens = metrics.completion_tokens;
+                    let total_tokens = prompt_tokens + completion_tokens;
+                    let usage_chunk = json!({
+                        "id": request_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_id,
+                        "choices": [],
+                        "usage": {
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": total_tokens,
+                        }
+                    });
+                    events.push(Ok(Event::default().data(usage_chunk.to_string())));
+                }
+
                 // OpenAI streaming sentinel — only on successful completion.
                 events.push(Ok(Event::default().data("[DONE]")));
             }
