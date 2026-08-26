@@ -108,9 +108,14 @@ fn main() {
 /// fall back to probing `metal3.1`. Returns 0 when nothing works (should be
 /// rare — means the toolchain is broken, not just old).
 fn detect_metal_version() -> u32 {
+    // Single-quoted so a toolchain path containing spaces survives the shell.
+    let metal = match metal_toolchain_bin() {
+        Some(dir) => format!("'{}'", dir.join("metal").display()),
+        None => "xcrun -sdk macosx metal".to_string(),
+    };
     for std_flag in &["metal4.0", "metal3.1"] {
         let script = format!(
-            "echo '__METAL_VERSION__' | xcrun -sdk macosx metal -std={std_flag} -E -x metal -P - 2>/dev/null | tail -1 | tr -d '\\n'",
+            "echo '__METAL_VERSION__' | {metal} -std={std_flag} -E -x metal -P - 2>/dev/null | tail -1 | tr -d '\\n'",
         );
         let output = Command::new("zsh").args(["-c", &script]).output();
         if let Ok(o) = output
@@ -147,6 +152,12 @@ fn detect_sdk_version() -> f64 {
 /// Provides actionable installation instructions on failure instead of
 /// a cryptic "Failed to run Metal compiler" panic.
 fn check_metal_toolchain() {
+    // A directly-resolved toolchain bypasses xcrun entirely, so xcrun's own
+    // (per-user) discovery failing is not a build blocker in that case.
+    if metal_toolchain_bin().is_some() {
+        return;
+    }
+
     // Check xcrun itself
     let xcrun_ok = Command::new("xcrun").args(["--find", "metal"]).output();
 
@@ -187,6 +198,88 @@ fn check_metal_toolchain() {
             );
         }
     }
+}
+
+/// Directory holding the Metal toolchain binaries (`metal`, `metallib`), if one
+/// can be resolved without relying on `xcrun`'s per-user discovery.
+///
+/// On macOS 26 (Tahoe) Apple moved the Metal compiler out of `Xcode.app` into a
+/// separately-downloaded cryptex mounted under
+/// `/private/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-*/`.
+/// `xcrun` locates it through a **per-user** index plist at
+/// `~/Library/Developer/Xcode/XcodeToMetalToolchainIndexMapping.plist`. A build
+/// running as a dedicated packaging account — MacPorts' `macports` user, a CI
+/// service account — has no such plist, so `xcrun -sdk macosx metal` fails with
+/// "cannot execute tool 'metal' due to missing Metal Toolchain" even though the
+/// toolchain is installed system-wide and works for the login user.
+///
+/// Resolution order:
+/// 1. `PMETAL_METAL_TOOLCHAIN_BIN` — explicit override for packagers.
+/// 2. The cryptex mount, when exactly one Metal toolchain is present.
+/// 3. `None` — callers fall back to plain `xcrun`, which is correct on
+///    macOS < 26 and for ordinary interactive builds.
+fn metal_toolchain_bin() -> Option<PathBuf> {
+    println!("cargo:rerun-if-env-changed=PMETAL_METAL_TOOLCHAIN_BIN");
+
+    if let Ok(dir) = env::var("PMETAL_METAL_TOOLCHAIN_BIN") {
+        let dir = PathBuf::from(dir);
+        if dir.join("metal").is_file() {
+            return Some(dir);
+        }
+        // An override that does not resolve is a packaging error, not something
+        // to paper over by silently falling back to a broken `xcrun`.
+        panic!(
+            "PMETAL_METAL_TOOLCHAIN_BIN is set to {} but no `metal` binary was found there",
+            dir.display()
+        );
+    }
+
+    // Sole cryptex mount, if unambiguous. More than one means we cannot tell
+    // which matches the active Xcode, so defer to xcrun rather than guess.
+    let mounts: Vec<PathBuf> = glob_metal_cryptex_mounts();
+    if mounts.len() == 1 {
+        return Some(mounts.into_iter().next().unwrap());
+    }
+    None
+}
+
+/// Enumerate `Metal.xctoolchain/usr/bin` directories under the cryptex mount root.
+///
+/// Hand-rolled rather than pulling in a glob crate: build-dependencies are a
+/// supply-chain surface, and this is a single fixed-depth directory scan.
+fn glob_metal_cryptex_mounts() -> Vec<PathBuf> {
+    const CRYPTEX_ROOT: &str = "/private/var/run/com.apple.security.cryptexd/mnt";
+    const PREFIX: &str = "com.apple.MobileAsset.MetalToolchain-";
+
+    let Ok(entries) = std::fs::read_dir(CRYPTEX_ROOT) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with(PREFIX))
+        .map(|e| e.path().join("Metal.xctoolchain/usr/bin"))
+        .filter(|p| p.join("metal").is_file())
+        .collect();
+    found.sort();
+    found
+}
+
+/// Build a `Command` for a Metal toolchain tool (`metal`, `metallib`).
+///
+/// Invokes the tool directly when [`metal_toolchain_bin`] resolved one,
+/// otherwise goes through `xcrun` exactly as before.
+fn metal_tool_command(tool: &str, out_dir: &Path, cache_root: &Path) -> Command {
+    let mut cmd = match metal_toolchain_bin() {
+        Some(dir) => Command::new(dir.join(tool)),
+        None => {
+            let mut c = Command::new("xcrun");
+            c.args(["-sdk", "macosx", tool]);
+            c
+        }
+    };
+    cmd.env("HOME", xcrun_home(out_dir));
+    cmd.env("XDG_CACHE_HOME", cache_root);
+    cmd
 }
 
 /// Return the HOME directory to use when invoking xcrun.
@@ -245,13 +338,8 @@ fn compile_metal_shaders(shaders_dir: &Path, out_dir: &Path, target: &str, lib_n
 
         println!("cargo:rerun-if-changed={}", metal_file.display());
 
-        let output = Command::new("xcrun")
-            .env("HOME", xcrun_home(out_dir))
-            .env("XDG_CACHE_HOME", &cache_root)
+        let output = metal_tool_command("metal", out_dir, &cache_root)
             .args([
-                "-sdk",
-                "macosx",
-                "metal",
                 // Metal language standard
                 std_flag,
                 // Optimization flags
@@ -295,10 +383,7 @@ fn compile_metal_shaders(shaders_dir: &Path, out_dir: &Path, target: &str, lib_n
     // Link all .air files into a single .metallib
     let metallib_file = out_dir.join(format!("{}.metallib", lib_name));
 
-    let mut cmd = Command::new("xcrun");
-    cmd.env("HOME", xcrun_home(out_dir));
-    cmd.env("XDG_CACHE_HOME", &cache_root);
-    cmd.args(["-sdk", "macosx", "metallib"]);
+    let mut cmd = metal_tool_command("metallib", out_dir, &cache_root);
 
     for air_file in &air_files {
         cmd.arg(air_file.to_str().unwrap());
